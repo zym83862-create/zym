@@ -280,7 +280,7 @@ jobs:
 
           Write-Host "RDP listener is ready."
 
-      - name: Runner Speed Test
+            - name: Runner Speed Test
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -288,23 +288,20 @@ jobs:
 
           $zip = Join-Path $env:TEMP "speedtest.zip"
           $dir = Join-Path $env:TEMP "speedtest"
+          $stdout = Join-Path $env:TEMP "speedtest-stdout.txt"
+          $stderr = Join-Path $env:TEMP "speedtest-stderr.txt"
 
-          Remove-Item `
-            $zip `
-            -Force `
-            -ErrorAction SilentlyContinue
+          Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $stdout -Force -ErrorAction SilentlyContinue
+          Remove-Item $stderr -Force -ErrorAction SilentlyContinue
 
-          Remove-Item `
-            $dir `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-          New-Item `
-            -ItemType Directory `
-            -Path $dir `
-            -Force |
-            Out-Null
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "RUNNER INTERNET SPEED TEST"
+          Write-Host "========================================"
 
           Invoke-WebRequest `
             -Uri "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-win64.zip" `
@@ -321,24 +318,61 @@ jobs:
             throw "speedtest.exe not found."
           }
 
-          $raw = & $exe `
-            "--accept-license" `
-            "--accept-gdpr" `
-            "--progress=no" `
-            "--format=json" 2>&1
+          Write-Host "Running Ookla Speedtest..."
 
-          if ($LASTEXITCODE -ne 0) {
-            $raw |
-              ForEach-Object {
+          $process = Start-Process `
+            -FilePath $exe `
+            -ArgumentList @(
+              "--accept-license",
+              "--accept-gdpr",
+              "--progress=no",
+              "--format=json"
+            ) `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -Wait `
+            -PassThru
+
+          Write-Host "Speedtest exit code: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0) {
+            Write-Host ""
+            Write-Host "Speedtest error output:"
+            if (Test-Path $stderr) {
+              Get-Content $stderr | ForEach-Object {
                 Write-Host $_
               }
+            }
 
             throw "Speedtest failed."
           }
 
-          $result = (
-            ($raw | Out-String).Trim()
-          ) | ConvertFrom-Json
+          $jsonText = Get-Content `
+            -Path $stdout `
+            -Raw
+
+          if ([string]::IsNullOrWhiteSpace($jsonText)) {
+            throw "Speedtest returned empty output."
+          }
+
+          try {
+            $result = $jsonText | ConvertFrom-Json
+          }
+          catch {
+            Write-Host ""
+            Write-Host "Raw Speedtest stdout:"
+            Write-Host $jsonText
+
+            Write-Host ""
+            Write-Host "Raw Speedtest stderr:"
+            if (Test-Path $stderr) {
+              Get-Content $stderr | ForEach-Object {
+                Write-Host $_
+              }
+            }
+
+            throw "Speedtest JSON parsing failed."
+          }
 
           $downloadMbps = [math]::Round(
             ([double]$result.download.bandwidth * 8) / 1000000,
@@ -365,8 +399,13 @@ jobs:
             2
           )
 
+          Write-Host ""
           Write-Host "========================================"
           Write-Host "ACTUAL RUNNER INTERNET SPEED"
+          Write-Host "========================================"
+          Write-Host "ISP:        $($result.isp)"
+          Write-Host "Server:     $($result.server.name)"
+          Write-Host "Location:   $($result.server.location)"
           Write-Host "Ping:       $ping ms"
           Write-Host "Download:   $downloadMbps Mbps"
           Write-Host "Download:   $downloadGbps Gbps"
