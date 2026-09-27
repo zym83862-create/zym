@@ -1,6 +1,4 @@
 
-          $exe = Join-Path $dir "speedtest.exe"
-
           if (-not (Test-Path $exe)) {
             throw "speedtest.exe not found."
           }
@@ -126,3 +124,5 @@
 
           Get-NetFirewallRule -DisplayName "RDP-Tailscale-TCP" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
           Get-NetFirewallRule -DisplayName "RDP-Tailscale-UDP" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
