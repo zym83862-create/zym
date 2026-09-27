@@ -1,128 +1,96 @@
+name: "RDP + Speed Test"
 
-          if (-not (Test-Path $exe)) {
-            throw "speedtest.exe not found."
-          }
+"on":
+  workflow_dispatch:
 
-          function Get-SpeedTestResult {
-            Remove-Item $stdout -Force -ErrorAction SilentlyContinue
-            Remove-Item $stderr -Force -ErrorAction SilentlyContinue
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350
 
-            & $exe --accept-license --accept-gdpr --progress=no --format=json > $stdout 2> $stderr
-            $exitCode = $LASTEXITCODE
-
-            if ($exitCode -ne 0) {
-              Write-Host "Speedtest stderr:"
-              if (Test-Path $stderr) {
-                Get-Content $stderr | ForEach-Object { Write-Host $_ }
-              }
-              throw "Speedtest failed with exit code $exitCode."
-            }
-
-            $raw = Get-Content $stdout -Raw
-
-            if ([string]::IsNullOrWhiteSpace($raw)) {
-              throw "Speedtest returned empty output."
-            }
-
-            $start = $raw.IndexOf("{")
-            $end = $raw.LastIndexOf("}")
-
-            if ($start -lt 0 -or $end -le $start) {
-              Write-Host "Speedtest stdout:"
-              Write-Host $raw
-              throw "No JSON object found in Speedtest output."
-            }
-
-            $json = $raw.Substring($start, $end - $start + 1)
-
-            try {
-              return ($json | ConvertFrom-Json)
-            }
-            catch {
-              Write-Host "Extracted Speedtest JSON:"
-              Write-Host $json
-              throw "Speedtest JSON parsing failed."
-            }
-          }
-
-          Write-Host "========================================"
-          Write-Host "ACTUAL RUNNER INTERNET SPEED"
-          Write-Host "Running 3 real measurements..."
-          Write-Host "========================================"
-
-          $results = @()
-
-          for ($i = 1; $i -le 3; $i++) {
-            Write-Host ""
-            Write-Host "Measurement $i of 3..."
-
-            $r = Get-SpeedTestResult
-
-            $downloadMbps = [math]::Round(([double]$r.download.bandwidth * 8) / 1000000, 2)
-            $uploadMbps = [math]::Round(([double]$r.upload.bandwidth * 8) / 1000000, 2)
-            $pingMs = [math]::Round([double]$r.ping.latency, 2)
-
-            $results += [pscustomobject]@{
-              DownloadMbps = $downloadMbps
-              UploadMbps = $uploadMbps
-              PingMs = $pingMs
-              Server = $r.server.name
-              Location = $r.server.location
-              ISP = $r.isp
-            }
-
-            Write-Host "Server:   $($r.server.name)"
-            Write-Host "Location: $($r.server.location)"
-            Write-Host "Ping:     $pingMs ms"
-            Write-Host "Download: $downloadMbps Mbps"
-            Write-Host "Upload:   $uploadMbps Mbps"
-
-            if ($i -lt 3) {
-              Start-Sleep -Seconds 3
-            }
-          }
-
-          $bestDownload = $results | Sort-Object DownloadMbps -Descending | Select-Object -First 1
-          $bestUpload = $results | Sort-Object UploadMbps -Descending | Select-Object -First 1
-          $avgDownload = [math]::Round((($results | Measure-Object -Property DownloadMbps -Average).Average), 2)
-          $avgUpload = [math]::Round((($results | Measure-Object -Property UploadMbps -Average).Average), 2)
-
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "FINAL MEASURED RUNNER SPEED"
-          Write-Host "========================================"
-          Write-Host "Best Download:    $($bestDownload.DownloadMbps) Mbps"
-          Write-Host "Best Download:    $([math]::Round($bestDownload.DownloadMbps / 1000, 3)) Gbps"
-          Write-Host "Best Upload:      $($bestUpload.UploadMbps) Mbps"
-          Write-Host "Best Upload:      $([math]::Round($bestUpload.UploadMbps / 1000, 3)) Gbps"
-          Write-Host "Average Download: $avgDownload Mbps"
-          Write-Host "Average Upload:   $avgUpload Mbps"
-          Write-Host "========================================"
-
-      - name: Show RDP Access
+    steps:
+      - name: Configure RDP
         shell: pwsh
         run: |
-          Write-Host "=== RDP ACCESS ==="
-          Write-Host "Address:  $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: GitHub Secret RDP_PASSWORD"
-          Write-Host "Command:  mstsc /v:$env:TAILSCALE_IP"
+          $ErrorActionPreference = "Stop"
 
-      - name: Maintain Connection
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "PortNumber" -Value 3389 -Force
+
+          Set-Service -Name "TermService" -StartupType Automatic
+          Restart-Service -Name "TermService" -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+      - name: Create RDP User
         shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          while ($true) {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP active..."
-            Start-Sleep -Seconds 300
+          $ErrorActionPreference = "Stop"
+
+          $username = "RDP"
+          $passwordText = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($passwordText)) {
+            throw "RDP_PASSWORD secret is missing."
           }
 
-      - name: Cleanup
-        if: always()
+          $securePassword = ConvertTo-SecureString $passwordText -AsPlainText -Force
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+          if ($null -ne $existing) {
+            Set-LocalUser -Name $username -Password $securePassword
+          }
+          else {
+            New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires -PasswordNeverExpires
+          }
+
+          Enable-LocalUser -Name $username
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+          "RDP_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+            throw "RDP user creation failed."
+          }
+
+          Write-Host "RDP user is ready."
+          Write-Host "Password was not printed."
+
+      - name: Install Tailscale
         shell: pwsh
         run: |
-          $ErrorActionPreference = "SilentlyContinue"
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
 
-          Get-NetFirewallRule -DisplayName "RDP-Tailscale-TCP" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-          Get-NetFirewallRule -DisplayName "RDP-Tailscale-UDP" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $p = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $installer, "/quiet", "/norestart") -Wait -PassThru
+
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          if ($p.ExitCode -ne 0) {
+            throw "Tailscale installation failed with exit code $($p.ExitCode)."
+          }
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale executable not found."
+          }
+
+          & $ts version
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
