@@ -1,108 +1,114 @@
-              Write-Host $raw
-              throw "No JSON object found in Speedtest output."
-            }
+name: RDP
 
-            $json = $raw.Substring($start, $end - $start + 1)
+on:
+  workflow_dispatch:
 
-            try {
-              return ($json | ConvertFrom-Json)
-            }
-            catch {
-              Write-Host "Extracted Speedtest JSON:"
-              Write-Host $json
-              throw "Speedtest JSON parsing failed."
-            }
-          }
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
-          Write-Host "========================================"
-          Write-Host "ACTUAL RUNNER INTERNET SPEED"
-          Write-Host "Running 3 real measurements..."
-          Write-Host "========================================"
-
-          $results = @()
-
-          for ($i = 1; $i -le 3; $i++) {
-            Write-Host ""
-            Write-Host "Measurement $i of 3..."
-
-            $r = Get-SpeedTestResult
-
-            $downloadMbps = [math]::Round(([double]$r.download.bandwidth * 8) / 1000000, 2)
-            $uploadMbps = [math]::Round(([double]$r.upload.bandwidth * 8) / 1000000, 2)
-            $pingMs = [math]::Round([double]$r.ping.latency, 2)
-
-            $results += [pscustomobject]@{
-              DownloadMbps = $downloadMbps
-              UploadMbps = $uploadMbps
-              PingMs = $pingMs
-              Server = $r.server.name
-              Location = $r.server.location
-              ISP = $r.isp
-            }
-
-            Write-Host "Server:   $($r.server.name)"
-            Write-Host "Location: $($r.server.location)"
-            Write-Host "Ping:     $pingMs ms"
-            Write-Host "Download: $downloadMbps Mbps"
-            Write-Host "Upload:   $uploadMbps Mbps"
-
-            if ($i -lt 3) {
-              Start-Sleep -Seconds 3
-            }
-          }
-
-          $bestDownload = $results | Sort-Object DownloadMbps -Descending | Select-Object -First 1
-          $bestUpload = $results | Sort-Object UploadMbps -Descending | Select-Object -First 1
-          $avgDownload = [math]::Round((($results | Measure-Object -Property DownloadMbps -Average).Average), 2)
-          $avgUpload = [math]::Round((($results | Measure-Object -Property UploadMbps -Average).Average), 2)
-
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "FINAL MEASURED RUNNER SPEED"
-          Write-Host "========================================"
-          Write-Host "Best Download:    $($bestDownload.DownloadMbps) Mbps"
-          Write-Host "Best Download:    $([math]::Round($bestDownload.DownloadMbps / 1000, 3)) Gbps"
-          Write-Host "Best Upload:      $($bestUpload.UploadMbps) Mbps"
-          Write-Host "Best Upload:      $([math]::Round($bestUpload.UploadMbps / 1000, 3)) Gbps"
-          Write-Host "Average Download: $avgDownload Mbps"
-          Write-Host "Average Upload:   $avgUpload Mbps"
-          Write-Host "========================================"
-
-      - name: Show RDP Access
-        shell: pwsh
+    steps:
+      - name: Configure Core RDP Settings
         run: |
-          Write-Host "=== RDP ACCESS ==="
-          Write-Host "Address:  $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: GitHub Secret RDP_PASSWORD"
-          Write-Host "Command:  mstsc /v:$env:TAILSCALE_IP"
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
       - name: Maintain Connection
-        shell: pwsh
         run: |
-          Write-Host "RDP and Exit Node are active."
-          Write-Host "Keep this workflow running while using the runner as a gateway."
-
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP/Exit Node active..."
-            Start-Sleep -Seconds 300
-          }
-
-      - name: Cleanup
-        if: always()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "SilentlyContinue"
-
-          Get-NetFirewallRule -DisplayName "RDP-Tailscale-TCP" -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule -ErrorAction SilentlyContinue
-
-          Get-NetFirewallRule -DisplayName "RDP-Tailscale-UDP" -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule -ErrorAction SilentlyContinue
-
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (Test-Path $ts) {
-            & $ts logout
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
           }
 
